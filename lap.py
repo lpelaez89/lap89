@@ -78,7 +78,6 @@ def extraer_datos_imagen(image_bytes, mime_type, api_key):
                 {"inlineData": {"mimeType": mime_type, "data": base64_img}}
             ]
         }],
-        # Forzamos a la IA a que devuelva un JSON puro para poder leerlo en Python
         "generationConfig": {"responseMimeType": "application/json"}
     }
     
@@ -139,12 +138,12 @@ with st.sidebar:
                         archivo.seek(0)
                         df = pd.read_csv(archivo, encoding='latin1')
                     
-                    cols = [str(c).strip().lower() for c in df.columns.tolist()]
+                    # Unimos todas las columnas en un solo texto para buscar palabras clave de forma súper segura
+                    texto_cols = " ".join([str(c).strip().lower() for c in df.columns.tolist()])
                     
-                    # Identificación heurística por palabras clave
-                    es_jugador = any('mins' in c or 'minuto' in c for c in cols) and any('game' in c or 'partido' in c for c in cols)
-                    es_equipo = any('liga' in c for c in cols) and any('gam' in c or 'ppg' in c for c in cols)
-                    es_plantilla = any('edad' in c for c in cols) and any('equipo' in c for c in cols) and any('nombre' in c for c in cols)
+                    es_equipo = 'liga' in texto_cols and ('gam' in texto_cols or 'ppg' in texto_cols)
+                    es_plantilla = 'edad' in texto_cols and ('contrato' in texto_cols or 'altura' in texto_cols)
+                    es_jugador = 'mins' in texto_cols and ('position' in texto_cols or 'partido' in texto_cols)
                     
                     if es_jugador:
                         pos = df['Position'].mode()[0] if 'Position' in df.columns else "Jugador"
@@ -159,9 +158,9 @@ with st.sidebar:
                         st.session_state.df_plantilla = df
                         st.success(f"✅ Plantilla detectada: {archivo.name}")
             
-            # Control de flujo
+            # CONTROL DE FLUJO CORREGIDO (Evita que vuelva al paso 1 si subes archivos más tarde)
             if st.session_state.stats_jugador is not None:
-                st.session_state.paso_actual = 1
+                st.session_state.paso_actual = max(st.session_state.paso_actual, 1)
             else:
                 st.error("No se detectó el archivo/imagen del Jugador.")
 
@@ -182,7 +181,6 @@ if st.session_state.paso_actual >= 1:
     stats_dict = st.session_state.stats_jugador
     posicion = st.session_state.posicion_jugador
     
-    # Crear un DataFrame visual a partir del diccionario de estadísticas extraídas/promediadas
     df_stats_visual = pd.DataFrame(list(stats_dict.items()), columns=["Métrica", "Valor Promedio"])
     
     col1, col2 = st.columns([1, 2])
@@ -195,24 +193,30 @@ if st.session_state.paso_actual >= 1:
         if st.button("Generar Interpretación de Perfil", key="btn_p1"):
             with st.spinner("Analizando métricas y fortalezas..."):
                 stats_texto = ", ".join([f"{k}: {v}" for k, v in stats_dict.items() if isinstance(v, (int, float)) and v > 0])
+                
+                # INSTRUCCIÓN DE IA ACTUALIZADA PARA SUGERIR MÉTRICAS DINÁMICAMENTE
                 prompt = f"""
                 Analiza estas métricas de un jugador en la posición: {posicion}. 
                 Métricas: {stats_texto}.
                 
                 Realiza dos tareas:
                 1. Redacta un análisis cualitativo de sus fortalezas y estilo de juego. NO copies sus números de manera robótica. Traduce los datos a conceptos tácticos reales de fútbol.
-                2. Sugiere y enlista dinámicamente las métricas específicas donde este jugador tiene un rendimiento que consideres de élite. NO uses una cantidad predefinida de métricas, solo las que realmente destaquen.
+                2. Al final del análisis, incluye una sección destacada llamada "🎯 MÉTRICAS CLAVE SUGERIDAS PARA BÚSQUEDA:". En esta sección, enumera las métricas específicas donde este jugador es de élite (usa los nombres o abreviaturas exactas del glosario si aplican). Explica brevemente por qué estas métricas son ideales para buscar un equipo con déficit en el siguiente paso. La cantidad de métricas sugeridas dependerá de los datos (no uses una cantidad predefinida, sugiere solo las que realmente destaquen).
                 """
                 st.session_state.analisis_p1 = analizar_con_gemini(prompt, api_key_gemini)
         
         if 'analisis_p1' in st.session_state:
             st.info(st.session_state.analisis_p1)
             
-    if st.session_state.paso_actual == 1 and st.session_state.df_equipos is not None:
+    # Lógica de Botón mejorada con avisos
+    if st.session_state.paso_actual == 1:
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("➡️ Siguiente Paso: Buscar Equipos con Déficit", type="primary"):
-            st.session_state.paso_actual = 2
-            st.rerun()
+        if st.session_state.df_equipos is not None:
+            if st.button("➡️ Siguiente Paso: Buscar Equipos con Déficit", type="primary"):
+                st.session_state.paso_actual = 2
+                st.rerun()
+        else:
+            st.warning("⚠️ Para avanzar a la Fase 2, sube el CSV de 'Estadísticas de Equipos' en el panel lateral y dale a Procesar.")
 
 # =====================================================================
 # PASO 2: GAP ANALYSIS (TOP 15)
@@ -226,14 +230,13 @@ if st.session_state.paso_actual >= 2:
     kpis_limpios = [k for k in kpis_equipos if k.lower() not in ['año', 'gam', 'ppg', 'p', 'xp']]
     
     kpis_clave = st.multiselect(
-        "Selecciona las métricas fuertes de tu jugador para buscar clubes que necesiten mejorar en eso:",
+        "Selecciona las métricas que te sugirió la IA para buscar clubes con déficit:",
         options=kpis_limpios,
         default=kpis_limpios[:2] if len(kpis_limpios) >= 2 else None
     )
     
     if kpis_clave:
         df_equipos['Deficit_Score'] = df_equipos[kpis_clave].rank(ascending=True).sum(axis=1)
-        # SOLICITUD APLICADA: Obtener el TOP 15 en lugar del TOP 5
         equipos_oportunidad = df_equipos.sort_values('Deficit_Score').head(15)
         
         col3, col4 = st.columns([1, 2])
@@ -245,7 +248,6 @@ if st.session_state.paso_actual >= 2:
             st.subheader("Justificación Estratégica (Gemini AI)")
             if st.button("Generar Justificación de Fichaje", key="btn_p2"):
                 with st.spinner("Evaluando encaje táctico de los primeros resultados..."):
-                    # Solo enviamos el top 5 o 6 a Gemini para no saturar el prompt con 15 equipos largos
                     nombres_equipos_clave = ", ".join(equipos_oportunidad.head(6)['Equipo'].tolist())
                     prompt = f"""
                     Nuestro jugador destaca en: {', '.join(kpis_clave)}.
@@ -257,11 +259,15 @@ if st.session_state.paso_actual >= 2:
             if 'analisis_p2' in st.session_state:
                 st.success(st.session_state.analisis_p2)
 
-    if st.session_state.paso_actual == 2 and st.session_state.df_plantilla is not None:
+    # Lógica de Botón mejorada con avisos
+    if st.session_state.paso_actual == 2:
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("➡️ Siguiente Paso: Analizar Viabilidad en Plantilla", type="primary"):
-            st.session_state.paso_actual = 3
-            st.rerun()
+        if st.session_state.df_plantilla is not None:
+            if st.button("➡️ Siguiente Paso: Analizar Viabilidad en Plantilla", type="primary"):
+                st.session_state.paso_actual = 3
+                st.rerun()
+        else:
+            st.warning("⚠️ Para avanzar a la Fase 3, sube el CSV de 'Estadísticas de Plantilla' en el panel lateral y dale a Procesar.")
 
 # =====================================================================
 # PASO 3: ANÁLISIS DE PLANTILLA
