@@ -1,20 +1,17 @@
 import streamlit as st
 import pandas as pd
 import requests
+import json
+import base64
 
 # Configuración de la página web
 st.set_page_config(page_title="AI Player Placement", layout="wide", page_icon="🧠")
 
-# --- FUNCIÓN PARA CONECTAR CON GEMINI ---
-def analizar_con_gemini(prompt, api_key):
-    if not api_key:
-        return "⚠️ Por favor, ingresa tu API Key de Gemini en el panel lateral para generar este análisis."
-    
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-    headers = {'Content-Type': 'application/json'}
-    
-    # Inyectamos el glosario de métricas en el System Prompt para que la IA tenga contexto absoluto
-    instrucciones_sistema = """Eres un Director Deportivo y Scout Senior experto en analítica de datos. Tu tono es sumamente profesional, estratégico y vas directo al grano.
+# --- FUNCIONES PARA CONECTAR CON GEMINI ---
+
+def obtener_instrucciones_sistema():
+    return """Eres un Director Deportivo y Scout Senior experto en analítica de datos. Tu tono es sumamente profesional, estratégico y vas directo al grano.
+    Comprendes a la perfección textos, métricas y contextos indistintamente en INGLÉS y ESPAÑOL.
     Comprendes a la perfección el siguiente glosario de métricas:
     - APD: Distancia Media de Pases (Average Pass Distance)
     - TWD%: Tackles/Fue Regateado (Tackles Won/Dribbled %)
@@ -38,139 +35,193 @@ def analizar_con_gemini(prompt, api_key):
     
     Utiliza este conocimiento para enriquecer tus análisis sin necesidad de explicar la métrica al usuario, simplemente demostrando que sabes cómo impacta en el juego."""
 
+def analizar_con_gemini(prompt, api_key):
+    if not api_key:
+        return "⚠️ Por favor, ingresa tu API Key de Gemini en el panel lateral."
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    
     data = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "systemInstruction": {
-            "parts": [{"text": instrucciones_sistema}]
-        }
+        "systemInstruction": {"parts": [{"text": obtener_instrucciones_sistema()}]}
     }
     
     try:
-        response = requests.post(url, headers=headers, json=data)
+        response = requests.post(url, headers={'Content-Type': 'application/json'}, json=data)
         response.raise_for_status()
         return response.json()['candidates'][0]['content']['parts'][0]['text']
     except Exception as e:
         return f"❌ Error al conectar con Gemini API: {e}"
 
-# --- INICIALIZACIÓN DE ESTADO PARA EL WIZARD (PASO A PASO) ---
+def extraer_datos_imagen(image_bytes, mime_type, api_key):
+    """Usa Gemini Vision para leer una imagen de estadísticas y devolverla como un diccionario estructurado"""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    base64_img = base64.b64encode(image_bytes).decode('utf-8')
+    
+    prompt = """
+    Extrae las estadísticas del jugador de esta imagen. Puede estar en inglés o español.
+    Devuelve ÚNICAMENTE un objeto JSON estrictamente estructurado con este formato exacto:
+    {
+        "Posicion": "Posición detectada (ej. MC, DMC, FW, etc. Si no la dice, pon 'Desconocida')",
+        "Stats": {
+            "Nombre Métrica 1": 85.5,
+            "Nombre Métrica 2": 12.0
+        }
+    }
+    Asegúrate de que los valores sean números (float/int). Si hay porcentajes, conviértelos a número (ej. 85% -> 85).
+    """
+    
+    data = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inlineData": {"mimeType": mime_type, "data": base64_img}}
+            ]
+        }],
+        # Forzamos a la IA a que devuelva un JSON puro para poder leerlo en Python
+        "generationConfig": {"responseMimeType": "application/json"}
+    }
+    
+    response = requests.post(url, headers={'Content-Type': 'application/json'}, json=data)
+    response.raise_for_status()
+    texto_json = response.json()['candidates'][0]['content']['parts'][0]['text']
+    return json.loads(texto_json)
+
+# --- INICIALIZACIÓN DE ESTADO PARA EL WIZARD ---
 if 'paso_actual' not in st.session_state: st.session_state.paso_actual = 0
-if 'df_jugador' not in st.session_state: st.session_state.df_jugador = None
+if 'stats_jugador' not in st.session_state: st.session_state.stats_jugador = None
+if 'posicion_jugador' not in st.session_state: st.session_state.posicion_jugador = None
 if 'df_equipos' not in st.session_state: st.session_state.df_equipos = None
 if 'df_plantilla' not in st.session_state: st.session_state.df_plantilla = None
 
 # --- UI: PANEL LATERAL ---
 with st.sidebar:
     st.header("⚙️ Configuración del Sistema")
-    api_key_gemini = st.text_input("🔑 API Key de Gemini", type="password", help="Obtén una gratis en Google AI Studio")
+    api_key_gemini = st.text_input("🔑 API Key de Gemini", type="password")
     
     st.divider()
     st.header("📂 Carga de Datos")
+    st.caption("Soporta CSV para Ligas/Plantillas y CSV o IMAGEN (PNG/JPG) para el Jugador.")
     
     archivos_subidos = st.file_uploader(
-        "Arrastra los 3 archivos CSV aquí", 
-        type=['csv'], 
+        "Arrastra tus archivos aquí", 
+        type=['csv', 'png', 'jpg', 'jpeg'], 
         accept_multiple_files=True
     )
 
-    # Botón explícito para iniciar el proceso
     if archivos_subidos:
         if st.button("🚀 Procesar Archivos y Comenzar", use_container_width=True):
             for archivo in archivos_subidos:
                 archivo.seek(0)
-                # Intento de lectura robusto (soporta diferentes formatos de CSV)
-                try:
-                    df = pd.read_csv(archivo)
-                except UnicodeDecodeError:
-                    archivo.seek(0)
-                    df = pd.read_csv(archivo, encoding='latin1')
                 
-                # Limpiar nombres de columnas para evitar fallos por espacios o mayúsculas
-                cols = [str(c).strip().lower() for c in df.columns.tolist()]
+                # SI ES UNA IMAGEN (Se asume que es el perfil del jugador)
+                if archivo.name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    if not api_key_gemini:
+                        st.error("⚠️ Para procesar imágenes necesitas ingresar la API Key arriba.")
+                        st.stop()
+                    
+                    with st.spinner(f"Analizando imagen: {archivo.name}..."):
+                        mime = f"image/{archivo.name.split('.')[-1].lower()}"
+                        mime = "image/jpeg" if mime == "image/jpg" else mime
+                        try:
+                            datos_img = extraer_datos_imagen(archivo.read(), mime, api_key_gemini)
+                            st.session_state.posicion_jugador = datos_img.get("Posicion", "Desconocida")
+                            st.session_state.stats_jugador = datos_img.get("Stats", {})
+                            st.success(f"✅ Jugador detectado (Imagen): {archivo.name}")
+                        except Exception as e:
+                            st.error(f"Error procesando la imagen: {e}")
                 
-                # Clasificador Automático mejorado (detección extra robusta por fragmentos)
-                es_jugador = any('mins' in c or 'minuto' in c for c in cols) and any('game' in c or 'partido' in c for c in cols)
-                es_equipo = any('liga' in c for c in cols) and any('gam' in c or 'ppg' in c for c in cols)
-                es_plantilla = any('edad' in c for c in cols) and any('equipo' in c for c in cols) and any('nombre' in c for c in cols)
-                
-                if es_jugador:
-                    st.session_state.df_jugador = df
-                    st.success(f"✅ Jugador detectado: {archivo.name}")
-                elif es_equipo:
-                    st.session_state.df_equipos = df
-                    st.success(f"✅ Equipos detectados: {archivo.name}")
-                elif es_plantilla:
-                    st.session_state.df_plantilla = df
-                    st.success(f"✅ Plantilla detectada: {archivo.name}")
+                # SI ES UN ARCHIVO CSV
+                elif archivo.name.lower().endswith('.csv'):
+                    try:
+                        df = pd.read_csv(archivo)
+                    except UnicodeDecodeError:
+                        archivo.seek(0)
+                        df = pd.read_csv(archivo, encoding='latin1')
+                    
+                    cols = [str(c).strip().lower() for c in df.columns.tolist()]
+                    
+                    # Identificación heurística por palabras clave
+                    es_jugador = any('mins' in c or 'minuto' in c for c in cols) and any('game' in c or 'partido' in c for c in cols)
+                    es_equipo = any('liga' in c for c in cols) and any('gam' in c or 'ppg' in c for c in cols)
+                    es_plantilla = any('edad' in c for c in cols) and any('equipo' in c for c in cols) and any('nombre' in c for c in cols)
+                    
+                    if es_jugador:
+                        pos = df['Position'].mode()[0] if 'Position' in df.columns else "Jugador"
+                        numericas = df.select_dtypes(include='number').columns
+                        st.session_state.stats_jugador = df[numericas].mean().round(2).to_dict()
+                        st.session_state.posicion_jugador = pos
+                        st.success(f"✅ Jugador detectado (CSV): {archivo.name}")
+                    elif es_equipo:
+                        st.session_state.df_equipos = df
+                        st.success(f"✅ Equipos detectados: {archivo.name}")
+                    elif es_plantilla:
+                        st.session_state.df_plantilla = df
+                        st.success(f"✅ Plantilla detectada: {archivo.name}")
             
-            # Si se leyó al menos el del jugador, avanzamos al Paso 1
-            if st.session_state.df_jugador is not None:
+            # Control de flujo
+            if st.session_state.stats_jugador is not None:
                 st.session_state.paso_actual = 1
             else:
-                st.error("No se detectó el archivo de Estadísticas del Jugador. Revisa que tenga las columnas 'Mins' y 'Position'.")
+                st.error("No se detectó el archivo/imagen del Jugador.")
 
 # --- UI: CUERPO PRINCIPAL ---
 st.title("🧠 AI Player Placement & Scouting")
-st.markdown("Plataforma interactiva impulsada por Python y Gemini para identificar oportunidades de mercado.")
+st.markdown("Plataforma interactiva impulsada por Python y Gemini Vision para identificar oportunidades de mercado.")
 st.divider()
 
-# =====================================================================
-# ESTADO 0: ESPERANDO ARCHIVOS
-# =====================================================================
 if st.session_state.paso_actual == 0:
-    st.info("👈 Por favor, carga tus archivos CSV en el panel izquierdo y haz clic en el botón 'Procesar Archivos y Comenzar'.")
+    st.info("👈 Carga tus archivos (CSV/Imágenes) en el panel izquierdo y haz clic en 'Procesar'.")
 
 # =====================================================================
 # PASO 1: ANÁLISIS DEL JUGADOR
 # =====================================================================
 if st.session_state.paso_actual >= 1:
-    st.header("Paso 1: Análisis e Interpretación del Perfil del Jugador")
-    df_jugador = st.session_state.df_jugador
+    st.header("Paso 1: Análisis e Interpretación del Perfil")
     
-    # Extraer posición y promedios
-    posicion = df_jugador['Position'].mode()[0] if 'Position' in df_jugador.columns else "Jugador"
-    columnas_numericas = df_jugador.select_dtypes(include='number').columns
-    promedios = df_jugador[columnas_numericas].mean().round(2)
+    stats_dict = st.session_state.stats_jugador
+    posicion = st.session_state.posicion_jugador
+    
+    # Crear un DataFrame visual a partir del diccionario de estadísticas extraídas/promediadas
+    df_stats_visual = pd.DataFrame(list(stats_dict.items()), columns=["Métrica", "Valor Promedio"])
     
     col1, col2 = st.columns([1, 2])
     with col1:
-        st.subheader("Métricas Promedio")
-        st.dataframe(promedios, use_container_width=True)
+        st.subheader(f"Métricas ({posicion})")
+        st.dataframe(df_stats_visual, use_container_width=True, hide_index=True)
     
     with col2:
         st.subheader("Análisis Cualitativo (Gemini AI)")
         if st.button("Generar Interpretación de Perfil", key="btn_p1"):
-            with st.spinner("Analizando métricas con IA..."):
-                stats_texto = ", ".join([f"{k}: {v}" for k, v in promedios.items() if v > 0])
+            with st.spinner("Analizando métricas y fortalezas..."):
+                stats_texto = ", ".join([f"{k}: {v}" for k, v in stats_dict.items() if isinstance(v, (int, float)) and v > 0])
                 prompt = f"""
-                Analiza estas métricas promedio por partido de un jugador en la posición: {posicion}. 
+                Analiza estas métricas de un jugador en la posición: {posicion}. 
                 Métricas: {stats_texto}.
                 
                 Realiza dos tareas:
-                1. Redacta un análisis cualitativo de sus fortalezas y estilo de juego. NO copies sus números. Traduce los datos a conceptos tácticos de fútbol reales (ej. si tiene alta eficiencia aérea, habla de su contundencia).
-                2. Sugiere y enlista las métricas específicas donde este jugador tiene un rendimiento destacado o de élite. La cantidad de métricas que sugieras NO debe ser predefinida; evalúa los números y selecciona dinámicamente solo aquellas métricas que realmente sean fortalezas clave para este jugador.
+                1. Redacta un análisis cualitativo de sus fortalezas y estilo de juego. NO copies sus números de manera robótica. Traduce los datos a conceptos tácticos reales de fútbol.
+                2. Sugiere y enlista dinámicamente las métricas específicas donde este jugador tiene un rendimiento que consideres de élite. NO uses una cantidad predefinida de métricas, solo las que realmente destaquen.
                 """
                 st.session_state.analisis_p1 = analizar_con_gemini(prompt, api_key_gemini)
         
         if 'analisis_p1' in st.session_state:
             st.info(st.session_state.analisis_p1)
             
-    # Botón para avanzar al Paso 2
     if st.session_state.paso_actual == 1 and st.session_state.df_equipos is not None:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("➡️ Siguiente Paso: Buscar Equipos con Déficit", type="primary"):
             st.session_state.paso_actual = 2
             st.rerun()
 
-
 # =====================================================================
-# PASO 2: GAP ANALYSIS
+# PASO 2: GAP ANALYSIS (TOP 15)
 # =====================================================================
 if st.session_state.paso_actual >= 2:
     st.divider()
     st.header("Paso 2: Búsqueda de Oportunidades en el Mercado")
     df_equipos = st.session_state.df_equipos
     
-    # Filtrar solo métricas relevantes (excluir Año, etc.)
     kpis_equipos = df_equipos.select_dtypes(include='number').columns.tolist()
     kpis_limpios = [k for k in kpis_equipos if k.lower() not in ['año', 'gam', 'ppg', 'p', 'xp']]
     
@@ -182,35 +233,35 @@ if st.session_state.paso_actual >= 2:
     
     if kpis_clave:
         df_equipos['Deficit_Score'] = df_equipos[kpis_clave].rank(ascending=True).sum(axis=1)
-        equipos_oportunidad = df_equipos.sort_values('Deficit_Score').head(5)
+        # SOLICITUD APLICADA: Obtener el TOP 15 en lugar del TOP 5
+        equipos_oportunidad = df_equipos.sort_values('Deficit_Score').head(15)
         
         col3, col4 = st.columns([1, 2])
         with col3:
-            st.subheader("Top 5 Clubes con Déficit")
+            st.subheader("Top 15 Clubes con Déficit")
             st.dataframe(equipos_oportunidad[['Equipo', 'Liga'] + kpis_clave].reset_index(drop=True), use_container_width=True)
         
         with col4:
             st.subheader("Justificación Estratégica (Gemini AI)")
             if st.button("Generar Justificación de Fichaje", key="btn_p2"):
-                with st.spinner("Evaluando encaje táctico..."):
-                    nombres_equipos = ", ".join(equipos_oportunidad['Equipo'].tolist())
+                with st.spinner("Evaluando encaje táctico de los primeros resultados..."):
+                    # Solo enviamos el top 5 o 6 a Gemini para no saturar el prompt con 15 equipos largos
+                    nombres_equipos_clave = ", ".join(equipos_oportunidad.head(6)['Equipo'].tolist())
                     prompt = f"""
                     Nuestro jugador destaca en: {', '.join(kpis_clave)}.
-                    Estos equipos tienen graves déficits estadísticos en esas áreas: {nombres_equipos}.
-                    Redacta una justificación de scouting explicando de forma persuasiva por qué nuestro jugador solucionaría las carencias tácticas de estos equipos.
+                    Estos son algunos de los equipos que tienen graves déficits estadísticos en esas áreas: {nombres_equipos_clave}.
+                    Redacta una justificación de scouting explicando de forma persuasiva por qué nuestro jugador solucionaría las carencias tácticas en estas ligas/equipos.
                     """
                     st.session_state.analisis_p2 = analizar_con_gemini(prompt, api_key_gemini)
                     
             if 'analisis_p2' in st.session_state:
                 st.success(st.session_state.analisis_p2)
 
-    # Botón para avanzar al Paso 3
     if st.session_state.paso_actual == 2 and st.session_state.df_plantilla is not None:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("➡️ Siguiente Paso: Analizar Viabilidad en Plantilla", type="primary"):
             st.session_state.paso_actual = 3
             st.rerun()
-
 
 # =====================================================================
 # PASO 3: ANÁLISIS DE PLANTILLA
@@ -228,16 +279,12 @@ if st.session_state.paso_actual >= 3:
     
     df_club = df_plantilla[df_plantilla[nombre_col_equipo] == club_seleccionado]
     
-    # Filtro de reemplazos: Edad >= 29 o Minutos bajos
     col_edad = [c for c in df_club.columns if 'edad' in c.lower()][0]
     col_min = [c for c in df_club.columns if 'minuto' in c.lower()][0]
-    
-    # Manejo dinámico de las demás columnas por si varían o tienen espacios invisibles
     col_contrato = [c for c in df_club.columns if 'contrato' in c.lower()][0] if any('contrato' in c.lower() for c in df_club.columns) else 'Fin de contrato'
     col_nombre = [c for c in df_club.columns if 'nombre' in c.lower()][0] if any('nombre' in c.lower() for c in df_club.columns) else 'Nombre'
     col_posicion = [c for c in df_club.columns if 'posici' in c.lower()][0] if any('posici' in c.lower() for c in df_club.columns) else 'Posición'
     
-    # Aseguramos que los valores sean numéricos para evitar errores de comparación
     df_club[col_edad] = pd.to_numeric(df_club[col_edad], errors='coerce').fillna(0)
     df_club[col_min] = pd.to_numeric(df_club[col_min], errors='coerce').fillna(0)
     
@@ -259,7 +306,7 @@ if st.session_state.paso_actual >= 3:
                 Planeamos ofrecer a nuestro jugador al club {club_seleccionado}.
                 Analizando su plantilla actual, estos jugadores podrían estar en fin de ciclo: {datos_plantilla}.
                 
-                Redacta un argumento comercial para el Director Deportivo indicando a quiénes reemplazaría nuestro jugador. Justifica los motivos deportivos y de viabilidad económica (masa salarial, fin de contratos, renovación).
+                Redacta un argumento comercial para el Director Deportivo indicando a quiénes reemplazaría nuestro jugador. Justifica los motivos deportivos y de viabilidad económica.
                 """
                 st.session_state.analisis_p3 = analizar_con_gemini(prompt, api_key_gemini)
                 
