@@ -110,6 +110,12 @@ with st.sidebar:
 
     if archivos_subidos:
         if st.button("🚀 Procesar Archivos y Comenzar", use_container_width=True):
+            # LIMPIEZA DE ESTADO: Evita duplicados si se presiona procesar múltiples veces
+            st.session_state.stats_jugador = None
+            st.session_state.posicion_jugador = None
+            st.session_state.df_equipos = None
+            st.session_state.df_plantilla = None
+            
             for archivo in archivos_subidos:
                 archivo.seek(0)
                 
@@ -152,10 +158,18 @@ with st.sidebar:
                         st.session_state.posicion_jugador = pos
                         st.success(f"✅ Jugador detectado (CSV): {archivo.name}")
                     elif es_equipo:
-                        st.session_state.df_equipos = df
+                        # En lugar de sobrescribir, fusionamos todas las ligas cargadas
+                        if st.session_state.df_equipos is None:
+                            st.session_state.df_equipos = df
+                        else:
+                            st.session_state.df_equipos = pd.concat([st.session_state.df_equipos, df], ignore_index=True)
                         st.success(f"✅ Equipos detectados: {archivo.name}")
                     elif es_plantilla:
-                        st.session_state.df_plantilla = df
+                        # Igual con las plantillas, las fusionamos todas
+                        if st.session_state.df_plantilla is None:
+                            st.session_state.df_plantilla = df
+                        else:
+                            st.session_state.df_plantilla = pd.concat([st.session_state.df_plantilla, df], ignore_index=True)
                         st.success(f"✅ Plantilla detectada: {archivo.name}")
             
             # CONTROL DE FLUJO CORREGIDO (Evita que vuelva al paso 1 si subes archivos más tarde)
@@ -225,6 +239,12 @@ if st.session_state.paso_actual >= 2:
     st.divider()
     st.header("Paso 2: Búsqueda de Oportunidades en el Mercado")
     df_equipos = st.session_state.df_equipos
+    
+    # Mostrar las ligas que se están analizando para confirmación visual
+    col_liga = [c for c in df_equipos.columns if 'liga' in c.lower()]
+    if col_liga:
+        ligas_cargadas = df_equipos[col_liga[0]].dropna().unique().tolist()
+        st.caption(f"🌍 Analizando {len(df_equipos)} equipos de {len(ligas_cargadas)} ligas diferentes: {', '.join(map(str, ligas_cargadas))}")
     
     kpis_equipos = df_equipos.select_dtypes(include='number').columns.tolist()
     kpis_limpios = [k for k in kpis_equipos if k.lower() not in ['año', 'gam', 'ppg', 'p', 'xp']]
